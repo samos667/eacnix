@@ -5,7 +5,11 @@
   runCommand,
   python3,
   openssl,
-  fedora-boot-chain,
+  # The vendor's signed shim (`shimx64.efi`).
+  shim,
+  # DER certificates Epic counts as well-known, which the vendor's boot path
+  # needs enrolled as MOKs (Bazzite: Universal Blue's).
+  wellKnownMoks ? [ ],
 }:
 
 let
@@ -16,7 +20,7 @@ let
   # The certificate shim trusts for grub and the kernel (its `.vendor_cert`
   # section). It always shows up in MokListRT; anything else there is a MOK.
   vendorCert =
-    runCommand "fedora-shim-vendor-cert"
+    runCommand "shim-vendor-cert"
       {
         nativeBuildInputs = [
           python3
@@ -24,7 +28,7 @@ let
         ];
       }
       ''
-        python3 - ${fedora-boot-chain}/EFI/fedora/shimx64.efi vendor-cert.der <<'EOF'
+        python3 - ${shim} vendor-cert.der <<'EOF'
         import struct, sys
         pe = open(sys.argv[1], "rb").read()
         off = struct.unpack_from("<I", pe, 0x3C)[0]
@@ -60,5 +64,7 @@ runCommand "eacnix-check"
   }
   ''
     makeWrapper ${lib.getExe unwrapped} $out/bin/eacnix-check \
-      --add-flags "--vendor-cert ${vendorCert}"
+      --add-flags "--vendor-cert ${vendorCert}${
+        lib.concatMapStrings (c: " --well-known-mok ${c}") wellKnownMoks
+      }"
   ''

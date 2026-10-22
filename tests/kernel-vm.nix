@@ -1,15 +1,23 @@
-# NixOS userspace on Fedora's signed kernel, without Secure Boot.
+# NixOS userspace on a vendor's signed kernel, without Secure Boot.
 # `lockdown=integrity` (set by the module) enforces module signatures on its
 # own, so loading modules here proves their signatures survived packaging.
+{
+  vendor,
+  # Bazzite's kernel flavour (`eacnix.bazzite.kernel`), and the test's suffix.
+  bazziteKernel ? "ogc",
+  suffix ? vendor,
+}:
 { pkgs, ... }:
 
 {
-  name = "eacnix-fedora-kernel-vm";
+  name = "eacnix-kernel-vm-${suffix}";
 
   nodes.machine = {
     imports = [ ../modules/eacnix.nix ];
     eacnix = {
       enable = true;
+      inherit vendor;
+      bazzite.kernel = bazziteKernel;
       mode = "system";
       # Direct kernel boot, no bootloader: tests/secure-boot-vm.nix covers the ESP.
       boot.install = false;
@@ -17,9 +25,10 @@
     environment.systemPackages = [
       pkgs.python3
       pkgs.xz
+      pkgs.zstd
     ];
-    # A sched_ext scheduler: its BPF program reads kernel config, which Fedora's
-    # kernel only provides through eacnix.kconfigServices.
+    # A sched_ext scheduler: its BPF program reads kernel config, which the
+    # vendor's kernel only provides through eacnix.kconfigServices.
     services.scx = {
       enable = true;
       scheduler = "scx_lavd";
@@ -30,12 +39,11 @@
     { nodes, ... }:
     let
       kernel = nodes.machine.boot.kernelPackages.kernel;
-      modules = "/run/booted-system/kernel-modules/lib/modules/${kernel.modDirVersion}";
     in
     ''
       machine.wait_for_unit("multi-user.target")
 
-      with subtest("Fedora's kernel is running"):
+      with subtest("${kernel.eacnix.vendorName}'s kernel is running"):
           machine.succeed("test $(uname -r) = ${kernel.modDirVersion}")
 
       with subtest("EAC requirements that don't need Secure Boot"):
@@ -54,8 +62,9 @@
           machine.succeed("test -s /sys/kernel/sched_ext/root/ops")
 
       with subtest("a module with its signature stripped is refused"):
+          # Fedora compresses modules with xz; Bazzite doesn't.
           machine.succeed(
-              "xz -dc ${modules}/kernel/drivers/net/dummy.ko.xz > /tmp/dummy.ko",
+              "m=$(modinfo -n dummy); case $m in *.xz) xz -dc $m;; *.zst) zstd -dc $m;; *) cat $m;; esac > /tmp/dummy.ko",
               "python3 -c \"import struct; d=open('/tmp/dummy.ko','rb').read()[:-28];"
               " n=struct.unpack('>I', d[-4:])[0];"
               " open('/tmp/dummy-unsigned.ko','wb').write(d[:-12-n])\"",

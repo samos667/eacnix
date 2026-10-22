@@ -36,6 +36,7 @@ PASS, WARN, FAIL, UNKNOWN = "pass", "warn", "fail", "unknown"
 
 # --- readers -----------------------------------------------------------------
 
+
 def read(path, mode="r"):
     """File contents, or None if it doesn't exist. PermissionError propagates."""
     try:
@@ -111,7 +112,61 @@ def common_name(der):
     return names[-1] if names else "?"
 
 
+# Signing authorities on Epic's published list of well-known keys, matched by
+# name in a certificate's subject or issuer, as Bazzite's `ujust
+# check-anticheat` does. Epic's list (via The FPS Review): Canonical, Fedora,
+# Universal Blue, Debian, openSUSE and SUSE, Rocky Linux, Microsoft's UEFI CA.
+# A name can be copied into a self-made certificate, so name-only matches are
+# reported as such.
+WELL_KNOWN = re.compile(
+    r"Canonical Ltd\. Master Certificate Authority|Fedora Secure Boot CA|Universal Blue"
+    r"|Debian Secure Boot CA|openSUSE Secure Boot CA|SUSE Linux Enterprise Secure Boot CA"
+    r"|Rocky Linux Secure Boot Root CA|Microsoft (Corporation )?UEFI CA"
+)
+
+# Name attributes: commonName, organizationName, organizationalUnitName.
+NAME_ATTRS = {b"\x03": "CN", b"\x0a": "O", b"\x0b": "OU"}
+
+
+def names(der):
+    """Every CN, O and OU string in DER data (subjects and issuers alike)."""
+    found = []
+    for m in re.finditer(rb"\x06\x03\x55\x04([\x03\x0a\x0b])([\x0c\x13\x14\x16])(.)", der, re.DOTALL):
+        length = m.group(3)[0]
+        found.append(der[m.end():m.end() + length].decode("utf-8", errors="replace"))
+    return found
+
+
+def well_known(der):
+    """The first well-known authority named in DER data, or None."""
+    for name in names(der):
+        if WELL_KNOWN.search(name):
+            return name
+    return None
+
+
+def authenticode(path):
+    """The PKCS#7 blobs in a PE image's certificate table (its Authenticode signatures)."""
+    pe = read(path, "rb")
+    if pe is None or pe[:2] != b"MZ":
+        return None
+    off = struct.unpack_from("<I", pe, 0x3C)[0]
+    opt = off + 24
+    magic = struct.unpack_from("<H", pe, opt)[0]
+    dirs = opt + (112 if magic == 0x20B else 96)
+    start, size = struct.unpack_from("<II", pe, dirs + 4 * 8)
+    blobs, pos = [], start
+    while pos + 8 <= start + size:
+        length = struct.unpack_from("<I", pe, pos)[0]
+        if length < 8:
+            break
+        blobs.append(pe[pos + 8:pos + length])
+        pos += (length + 7) & ~7
+    return blobs
+
+
 # --- TPM event log -------------------------------------------------------------
+
 
 def parse_event_log(data):
     """[(pcr, type, event data)] from a TCG2 crypto-agile event log."""
@@ -187,9 +242,20 @@ def check_secure_boot(r):
     sb, setup = efivar("SecureBoot"), efivar("SetupMode")
     if sb is None:
         return r.add("secure-boot", req, UNKNOWN, "no SecureBoot variable")
-    if sb[:1] == b"\x01" and setup[:1] == b"\x00":
-        return r.add("secure-boot", req, PASS, "enabled, user mode")
-    r.add("secure-boot", req, FAIL, f"SecureBoot={sb[0]}, SetupMode={setup[0] if setup else '?'}")
+    if sb[:1] != b"\x01" or setup[:1] != b"\x00":
+        return r.add("secure-boot", req, FAIL, f"SecureBoot={sb[0]}, SetupMode={setup[0] if setup else '?'}")
+    # `mokutil --disable-validation` makes shim boot anything while the
+    # firmware still reports Secure Boot; shim then sets MokSBStateRT to 1.
+    try:
+        state = read(f"{MOK_VARIABLES}/MokSBStateRT", "rb")
+    except PermissionError:
+        state = None
+    if state is None:
+        state = efivar("MokSBStateRT", SHIM_GUID)
+    if state and state[:1] == b"\x01":
+        return r.add("secure-boot", req, FAIL,
+                     "shim's validation is disabled (MokSBStateRT); re-enable it with 'mokutil --enable-validation'")
+    r.add("secure-boot", req, PASS, "enabled, user mode, shim validating")
 
 
 def check_tpm(r):
@@ -250,18 +316,72 @@ def check_event_log(r, args):
         r.add("dma-protection", "IOMMU: pre-boot DMA protection", PASS, "firmware didn't report pre-boot DMA protection as disabled")
 
 
+def out_of_tree_modules():
+    """Loaded modules whose own taint flags include O (out-of-tree)."""
+    found = []
+    for m in sorted(os.listdir("/sys/module")):
+        # Built-in modules have no `taint`; /sys/module also holds plain files.
+        taint = f"/sys/module/{m}/taint"
+        if os.path.isfile(taint) and "O" in read(taint):
+            found.append(m)
+    return found
+
+
 def check_kernel(r, args):
     req = "Signed kernel and modules (well-known keys)"
     release = os.uname().release
     tainted = int((read("/proc/sys/kernel/tainted") or "0").strip())
-    problems = []
+    problems, notes = [], []
     if args.kernel_release and release != args.kernel_release:
         problems.append(f"running {release}, expected the vendor kernel {args.kernel_release}")
-    if tainted & (1 << 13):
-        problems.append("an unsigned module was loaded (taint E)")
+
+    # Who signed the running kernel's image.
+    blobs = authenticode(args.kernel)
+    if blobs is None:
+        problems.append(f"can't read the kernel image at {args.kernel}")
+    elif not blobs:
+        problems.append("the kernel image is not signed")
+    else:
+        signer = next((w for w in map(well_known, blobs) if w), None)
+        if signer is None:
+            cns = sorted({n for b in blobs for n in names(b)})
+            problems.append(f"the kernel is signed by {', '.join(cns) or '?'}, none of them well-known")
+        else:
+            notes.append(f"kernel signed under '{signer}'")
+    # The copy grub loaded from the ESP has to be that same image.
+    # grub writes BOOT_IMAGE=(hd0,gpt1)/EFI/...: drop its device prefix.
+    m = re.search(r"\bBOOT_IMAGE=(?:\([^)]*\))?(\S+)", read("/proc/cmdline") or "")
+    if m and args.esp and blobs:
+        booted = os.path.join(args.esp, m.group(1).lstrip("/"))
+        try:
+            loaded = read(booted, "rb")
+        except PermissionError:
+            loaded = None
+        if loaded is None:
+            notes.append(f"couldn't read {booted} to compare it with the running kernel")
+        elif loaded != read(args.kernel, "rb"):
+            problems.append(f"{booted}, which grub loaded, differs from {args.kernel}")
+        else:
+            notes.append("same image grub loaded from the ESP")
+
+    unsigned = [m for m in sorted(os.listdir("/sys/module"))
+                if os.path.isfile(f"/sys/module/{m}/taint") and "E" in read(f"/sys/module/{m}/taint")]
+    if unsigned:
+        problems.append(f"unsigned modules loaded (taint E): {', '.join(unsigned)}")
+    elif tainted & (1 << 13):
+        problems.append("an unsigned module was loaded during this boot (taint E; reboot to clear)")
     if tainted & (1 << 12):
-        problems.append("an out-of-tree module was loaded (taint O)")
-    r.add("signed-kernel", req, FAIL if problems else PASS, "; ".join(problems) or f"{release}, no unsigned or out-of-tree modules")
+        # Without taint E, every loaded module passed signature verification
+        # against a key the kernel trusts; the `mok` check covers MOK keys.
+        # Epic allows out-of-tree modules (NVIDIA's named) built by an
+        # organization and signed with a well-known key.
+        # The taint stays after a module unloads (or fails to initialise).
+        loaded = out_of_tree_modules()
+        notes.append(f"vendor-signed out-of-tree modules: {', '.join(loaded)}" if loaded
+                     else "a vendor-signed out-of-tree module was loaded earlier this boot")
+    if problems:
+        return r.add("signed-kernel", req, FAIL, "; ".join(problems))
+    r.add("signed-kernel", req, PASS, f"{release}, no unsigned modules" + "".join(f"; {n}" for n in notes))
 
 
 def check_lockdown(r):
@@ -275,7 +395,9 @@ def check_lockdown(r):
 
 def check_kexec(r):
     value = (read("/proc/sys/kernel/kexec_load_disabled") or "").strip()
-    r.add("kexec", "kexec disabled", PASS if value == "1" else FAIL, f"kernel.kexec_load_disabled = {value or '?'}")
+    if not value:
+        return r.add("kexec", "kexec disabled", PASS, "no kexec_load_disabled sysctl: the kernel has no kexec")
+    r.add("kexec", "kexec disabled", PASS if value == "1" else FAIL, f"kernel.kexec_load_disabled = {value}")
 
 
 def check_bpf_lsm(r):
@@ -283,11 +405,29 @@ def check_bpf_lsm(r):
     r.add("bpf-lsm", "BPF LSM loaded and active", PASS if "bpf" in lsms else FAIL, f"active LSMs: {','.join(lsms)}")
 
 
+def handheld():
+    """Whether this is a handheld, the way Bazzite's check-anticheat tells.
+
+    Epic requires the IOMMU only "on non-handheld devices" without defining
+    them. Bazzite counts Valve hardware and SMBIOS chassis types 30-32
+    (tablet, convertible, detachable), which is how handhelds report.
+    """
+    vendor = (read("/sys/class/dmi/id/sys_vendor") or "").strip()
+    chassis = (read("/sys/class/dmi/id/chassis_type") or "").strip()
+    return vendor == "Valve" or chassis in ("30", "31", "32")
+
+
 def check_iommu(r):
-    req = "IOMMU on, passthrough off"
+    req = "IOMMU on, passthrough off (non-handheld)"
+    if handheld():
+        return r.add("iommu", req, PASS, "handheld (Valve hardware or chassis type 30-32): not required")
+    cmdline = (read("/proc/cmdline") or "").split()
+    forced = [a for a in cmdline if a in ("iommu=pt", "iommu=off", "iommu.passthrough=1",
+                                          "amd_iommu=pt", "amd_iommu=off", "intel_iommu=off")]
+    hint = f" (kernel command line: {' '.join(forced)})" if forced else ""
     iommus = os.listdir("/sys/class/iommu") if os.path.isdir("/sys/class/iommu") else []
     if not iommus:
-        return r.add("iommu", req, FAIL, "no IOMMU is active")
+        return r.add("iommu", req, FAIL, f"no IOMMU is active{hint}")
     groups = "/sys/kernel/iommu_groups"
     identity = []
     total = 0
@@ -298,6 +438,8 @@ def check_iommu(r):
                 base = f"{groups}/{g}/devices/{dev}"
                 driver = os.path.basename(os.readlink(f"{base}/driver")) if os.path.exists(f"{base}/driver") else "-"
                 identity.append(f"group {g}: {dev} ({driver})")
+    if forced:
+        return r.add("iommu", req, FAIL, f"passthrough forced{hint}")
     if identity:
         return r.add("iommu", req, WARN,
                      f"{len(identity)} of {total} groups in passthrough (identity) mode: {'; '.join(identity)}. "
@@ -306,7 +448,7 @@ def check_iommu(r):
 
 
 def check_mok(r, args):
-    req = "No self-enrolled MOK"
+    req = "Only well-known MOKs"
     try:
         data = read(f"{MOK_VARIABLES}/MokListRT", "rb")
     except PermissionError:
@@ -316,16 +458,37 @@ def check_mok(r, args):
     if data is None:
         return r.add("mok", req, UNKNOWN, "no MokListRT: shim isn't in this boot's chain")
     certs, hashes = signature_lists(data)
-    vendor = read(args.vendor_cert, "rb") if args.vendor_cert else None
-    extra = [common_name(c) for c in certs if c != vendor]
+    # Certificates eacnix knows byte for byte: shim's own vendor certificate
+    # (always in MokListRT) and the vendor path's MOKs (Bazzite: Universal
+    # Blue's). Anything else passes only if it names a well-known authority.
+    exact = [read(path, "rb") for path in [args.vendor_cert, *args.well_known_mok] if path]
+    verified, by_name, unknown = [], [], []
+    for c in certs:
+        if c in exact:
+            verified.append(common_name(c))
+        elif well_known(c):
+            by_name.append(common_name(c))
+        else:
+            unknown.append(common_name(c))
+    if unknown:
+        return r.add("mok", req, FAIL,
+                     f"not well-known: {', '.join(unknown)}. Export them with 'mokutil --export', "
+                     "then remove each with 'sudo mokutil --delete MOK-000N.der'")
+    detail = f"verified: {', '.join(verified) or 'none'}"
+    if by_name:
+        detail += f"; well-known by name only (not checked byte for byte): {', '.join(by_name)}"
     if hashes:
-        extra.append(f"{hashes} hash(es)")
-    if extra:
-        return r.add("mok", req, FAIL, f"MOK list holds more than shim's vendor certificate: {', '.join(extra)}")
-    r.add("mok", req, PASS, f"only shim's vendor certificate ({common_name(vendor) if vendor else '?'})")
+        # The kernel ignores hashes in MokList (it loads only X.509 MOKs), so
+        # they don't affect module signing; they let shim boot specific
+        # binaries. Epic's rule names keys, so how EAC treats them is unknown.
+        return r.add("mok", req, WARN,
+                     f"{detail}; {hashes} image hash(es) enrolled, which let shim boot specific binaries. "
+                     "Whether EAC accepts MOK hashes is unknown")
+    r.add("mok", req, PASS, detail)
 
 
 # --- main ----------------------------------------------------------------------
+
 
 SYMBOL = {PASS: "✓", WARN: "!", FAIL: "✗", UNKNOWN: "?"}
 
@@ -334,7 +497,11 @@ def main():
     p = argparse.ArgumentParser(prog="eacnix-check", description=__doc__.split("\n\n")[0])
     p.add_argument("--dir", default="eacnix", help="eacnix's directory under <ESP>/EFI")
     p.add_argument("--kernel-release", help="the vendor kernel's `uname -r`")
+    p.add_argument("--kernel", default="/run/booted-system/kernel", help="the running kernel's image")
+    p.add_argument("--esp", help="the ESP's mount point, to compare the kernel grub loaded")
     p.add_argument("--vendor-cert", help="DER certificate embedded in the vendor shim")
+    p.add_argument("--well-known-mok", action="append", default=[], metavar="DER",
+                   help="a well-known MOK certificate the vendor path needs (repeatable)")
     p.add_argument("--json", action="store_true", help="print results as JSON")
     args = p.parse_args()
 
