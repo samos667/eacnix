@@ -34,10 +34,11 @@ let
 
       # Module packages the vendor signed (Bazzite's NVIDIA modules) carry
       # passthru.eacnix.vendorSigned; anything else is built locally, unsigned.
-      unsigned = lib.filter (p: !(p.eacnix.vendorSigned or false));
+      signed = p: p.eacnix.vendorSigned or false;
+      unsigned = lib.filter (p: !(signed p));
 
       # Which files put unsigned modules in boot.extraModulePackages, so the
-      # assertion can point at the option to turn off (e.g. hardware.xone).
+      # warning can point at the option that adds them (e.g. hardware.xone).
       extraModuleSources =
         lib.concatMapStrings
           (d: "\n  - ${d.file}: ${lib.concatMapStringsSep ", " (p: p.name or "?") (unsigned d.value)}")
@@ -47,13 +48,22 @@ let
       nvidiaEnabled = config.hardware.nvidia.enabled;
       nvidiaHint = lib.optionalString (nvidiaEnabled && !cfg.nvidia.enable) ''
 
-        For NVIDIA's driver, use a vendor's signed open modules instead:
+        For NVIDIA's driver, use Universal Blue's signed modules instead:
           eacnix.vendor = "bazzite";
           eacnix.nvidia.enable = true;'';
     in
     {
       # Signed kernel and modules, using well-known keys.
       boot.kernelPackages = lib.mkForce vendor.linuxPackages;
+
+      # Locally built modules (boot.extraModulePackages without a vendor
+      # signature) can't load under lockdown, so the eac system's module tree
+      # (and its initrd's) leaves them out; the normal system keeps them.
+      # They're never built for the vendor kernel. boot.kernelModules entries
+      # for them just fail to load: systemd-modules-load ignores that.
+      system.modulesTree = lib.mkForce (
+        [ (lib.getOutput "modules" kernel) ] ++ lib.filter signed config.boot.extraModulePackages
+      );
 
       # NVIDIA: the vendor's signed open kernel modules and the userspace of the
       # same version, instead of modules built locally against the kernel.
@@ -109,23 +119,23 @@ let
           );
         in
         lib.optional (missing != [ ])
-          "eacnix: ${vendorName}'s kernel has no ${lib.concatStringsSep ", " missing}; the initrd will omit them.";
+          "eacnix: ${vendorName}'s kernel has no ${lib.concatStringsSep ", " missing}; the initrd will omit them."
+        ++
+          lib.optional (missingModules config.boot.initrd.kernelModules != [ ])
+            "eacnix: boot.initrd.kernelModules names modules ${vendorName}'s kernel lacks: ${lib.concatStringsSep ", " (missingModules config.boot.initrd.kernelModules)}. The eac path's initrd omits them, so it may not boot if it needs them (e.g. a root filesystem on ZFS)."
+        ++
+          lib.optional (unsigned config.boot.extraModulePackages != [ ])
+            "eacnix: the eac path leaves out these unsigned kernel modules, which ${vendorName}'s kernel would refuse under lockdown${
+              if cfg.mode == "specialisation" then
+                "; your normal system still uses them"
+              else
+                " (eacnix.mode = \"system\": nothing loads them)"
+            }. Defined by:${extraModuleSources}${nvidiaHint}";
 
       assertions = [
         {
-          assertion = missingModules config.boot.initrd.kernelModules == [ ];
-          message = "eacnix: boot.initrd.kernelModules names modules ${vendorName}'s kernel lacks: ${lib.concatStringsSep ", " (missingModules config.boot.initrd.kernelModules)}";
-        }
-        {
           assertion = lib.elem "bpf" config.security.lsm;
           message = "eacnix: EAC requires the BPF LSM, but security.lsm doesn't include \"bpf\".";
-        }
-        {
-          assertion = unsigned config.boot.extraModulePackages == [ ];
-          message = ''
-            eacnix: boot.extraModulePackages builds unsigned modules, which ${vendorName}'s kernel refuses under lockdown. Defined by:${extraModuleSources}
-            Turn the option that adds them off in the eac specialisation only, e.g.
-              specialisation.eac.configuration.hardware.xone.enable = lib.mkForce false;${nvidiaHint}'';
         }
         {
           assertion =

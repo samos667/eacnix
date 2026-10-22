@@ -66,6 +66,10 @@
         pkgs.tpm2-tools
         pkgs.efibootmgr
       ];
+
+      # A locally built (unsigned) module: the normal system keeps it, the
+      # eac system leaves it out with a warning instead of failing.
+      boot.extraModulePackages = [ config.boot.kernelPackages.xpadneo ];
     };
 
   testScript =
@@ -162,6 +166,10 @@
           machine.succeed("test $(uname -r) = ${release}")
           machine.succeed("grep -q 'BOOT_IMAGE=.*/EFI/eacnix/kernels/' /proc/cmdline")
           machine.succeed("bootctl status 2>/dev/null | grep -q 'Secure Boot: enabled (user)'")
+
+      with subtest("the eac system leaves out the unsigned module the normal system has"):
+          machine.fail("modinfo hid_xpadneo")
+          machine.succeed("find -L /nix/var/nix/profiles/system/kernel-modules/lib/modules -name 'hid-xpadneo.ko*' | grep -q .")
 
       with subtest("EAC requirements"):
           machine.succeed("grep -q '\\[integrity\\]' /sys/kernel/security/lockdown")

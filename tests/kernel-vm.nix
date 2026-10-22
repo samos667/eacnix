@@ -12,28 +12,34 @@
 {
   name = "eacnix-kernel-vm-${suffix}";
 
-  nodes.machine = {
-    imports = [ ../modules/eacnix.nix ];
-    eacnix = {
-      enable = true;
-      inherit vendor;
-      bazzite.kernel = bazziteKernel;
-      mode = "system";
-      # Direct kernel boot, no bootloader: tests/secure-boot-vm.nix covers the ESP.
-      boot.install = false;
+  nodes.machine =
+    { config, ... }:
+    {
+      imports = [ ../modules/eacnix.nix ];
+      # A locally built (unsigned) module. With mode = "system" the eac config
+      # is the whole system, so it's left out (and never built for the vendor
+      # kernel) with a warning, instead of failing evaluation.
+      boot.extraModulePackages = [ config.boot.kernelPackages.xpadneo ];
+      eacnix = {
+        enable = true;
+        inherit vendor;
+        bazzite.kernel = bazziteKernel;
+        mode = "system";
+        # Direct kernel boot, no bootloader: tests/secure-boot-vm.nix covers the ESP.
+        boot.install = false;
+      };
+      environment.systemPackages = [
+        pkgs.python3
+        pkgs.xz
+        pkgs.zstd
+      ];
+      # A sched_ext scheduler: its BPF program reads kernel config, which the
+      # vendor's kernel only provides through eacnix.kconfigServices.
+      services.scx = {
+        enable = true;
+        scheduler = "scx_lavd";
+      };
     };
-    environment.systemPackages = [
-      pkgs.python3
-      pkgs.xz
-      pkgs.zstd
-    ];
-    # A sched_ext scheduler: its BPF program reads kernel config, which the
-    # vendor's kernel only provides through eacnix.kconfigServices.
-    services.scx = {
-      enable = true;
-      scheduler = "scx_lavd";
-    };
-  };
 
   testScript =
     { nodes, ... }:
@@ -50,6 +56,9 @@
           machine.succeed("grep -q '\\[integrity\\]' /sys/kernel/security/lockdown")
           machine.succeed("grep -qw bpf /sys/kernel/security/lsm")
           machine.succeed("test $(cat /proc/sys/kernel/kexec_load_disabled) = 1")
+
+      with subtest("the unsigned module is left out"):
+          machine.fail("modinfo hid_xpadneo")
 
       with subtest("signed modules load"):
           machine.succeed("modprobe 8021q")

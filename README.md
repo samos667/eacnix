@@ -16,8 +16,10 @@ The first milestone is done. You can use eacnix today if your machine:
 - is x86_64 with UEFI, Secure Boot, and a TPM 2.0;
 - boots NixOS with **systemd-boot** or **lanzaboote** (detected
   automatically);
-- uses **no locally built kernel modules** on the eac path (ZFS from
-  nixpkgs, `xone`, and similar; see [Limitations](#limitations)). NVIDIA GPUs
+- doesn't need **locally built kernel modules** on the eac path (ZFS from
+  nixpkgs, `xone`, and similar): the eac path leaves them out with a
+  warning, and your normal system keeps them (see
+  [Limitations](#limitations)). NVIDIA GPUs
   work with `eacnix.vendor = "bazzite"` and `eacnix.nvidia.enable`, which
   use Universal Blue's signed builds of NVIDIA's modules: the open ones for
   Turing and newer (tested in VMs without a GPU so far). For pre-Turing GPUs
@@ -241,8 +243,11 @@ in [docs/findings.md](docs/findings.md).
 
 - **No locally built kernel modules on the eac path.** Anything built
   locally is unsigned, so ZFS from nixpkgs, `v4l2loopback`, `xone`, and
-  similar can't load. The build fails and names the NixOS module file that
-  added each one, so you can turn that option off for the eac path only.
+  similar can't load under lockdown. The eac path leaves them out of its
+  module tree and initrd, and the rebuild prints a warning naming each one
+  and the NixOS module file that added it; your normal system keeps using
+  them. If the eac path needs one to boot (a root filesystem on ZFS, for
+  example), it won't boot.
 - **NVIDIA needs Bazzite.** Fedora doesn't ship signed NVIDIA modules.
   Universal Blue ships signed builds of NVIDIA's open modules for Bazzite's
   current kernel (Turing and newer), and of the proprietary 580 modules only

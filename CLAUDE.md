@@ -19,10 +19,14 @@ for the evidence behind them.
   drift by regenerating them; editing them by hand doesn't help.
 - **Everything in the `eac` specialisation comes from the vendor.** Every
   kernel module is vendor-signed, and every boot-chain binary
-  (shim, grub, kernel) is a vendor binary. Enforce this with assertions
-  (`boot.kernelPatches` empty; `boot.extraModulePackages` holds only
-  packages with `passthru.eacnix.vendorSigned`, i.e. unpacked vendor builds
-  such as Bazzite's NVIDIA modules in `pkgs/bazzite/nvidia.nix`).
+  (shim, grub, kernel) is a vendor binary. `boot.kernelPatches` must be
+  empty (asserted). The eac system's `system.modulesTree` keeps only the
+  `boot.extraModulePackages` with `passthru.eacnix.vendorSigned` (unpacked
+  vendor builds such as Bazzite's NVIDIA modules in
+  `pkgs/bazzite/nvidia.nix`) and warns about the rest, which the normal
+  system keeps; dropped packages are never built for the vendor kernel. Set
+  `system.modulesTree`, not `boot.extraModulePackages`: overriding the option
+  you filter recurses.
 - **Pin related artifacts together.** Shim, grub, and kernel are pinned by
   hash from the same vendor release, and the update script bumps them as a
   set. Universal Blue's NVIDIA modules are built per kernel and NVIDIA's
