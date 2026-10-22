@@ -174,14 +174,15 @@ in
         description = "Seconds grub shows its menu on the eac path.";
       };
 
-      hideFromSystemdBoot = lib.mkOption {
+      hideFromBootMenu = lib.mkOption {
         type = lib.types.bool;
         default = true;
         description = ''
-          Remove the eac specialisation from systemd-boot's menu. Booting it
-          from there runs Fedora's kernel behind unsigned systemd-boot, which
-          lands in the measured chain; only `eac-reboot` (firmware -> shim ->
-          grub) is the compliant path.
+          Remove the eac specialisation from systemd-boot's menu (the entries
+          systemd-boot or lanzaboote write for it). Booting it from there runs
+          Fedora's kernel behind systemd-boot (and lanzaboote's stub), which
+          land in the measured chain instead of shim and grub; only
+          `eac-reboot` or the firmware entry is the compliant path.
         '';
       };
 
@@ -213,6 +214,40 @@ in
   config = lib.mkIf cfg.enable (
     let
       eacnix-boot = eacnixPkgs.eacnix-boot;
+      # lanzaboote is a separate module; `or` keeps configs without it working.
+      lanzaboote = config.boot.lanzaboote.enable or false;
+      warnIfFailed = ''
+        if ! ${installCommand}; then
+          echo "warning: eacnix: the eac boot path was not updated (see above)." >&2
+        fi
+      '';
+      # Which eac systems to look for, and which bootloader entries to hide.
+      hideArgs = [
+        "--subpath"
+        (if cfg.mode == "specialisation" then "specialisation/eac" else "")
+      ]
+      ++ lib.optionals (cfg.boot.hideFromBootMenu && config.boot.loader.systemd-boot.enable) [
+        "--hide-systemd-boot-entries"
+        "${
+          if config.boot.loader.systemd-boot.xbootldrMountPoint != null then
+            config.boot.loader.systemd-boot.xbootldrMountPoint
+          else
+            config.boot.loader.efi.efiSysMountPoint
+        }/loader/entries"
+      ]
+      # lanzaboote builds a signed UKI per specialisation in EFI/Linux, which
+      # systemd-boot lists on its own.
+      ++ lib.optionals (cfg.boot.hideFromBootMenu && lanzaboote) [
+        "--hide-uki-entries"
+        "${config.boot.loader.efi.efiSysMountPoint}/EFI/Linux"
+      ];
+      hideCommand = lib.escapeShellArgs (
+        [
+          (lib.getExe eacnix-boot)
+          "hide"
+        ]
+        ++ hideArgs
+      );
       installCommand = lib.escapeShellArgs (
         [
           (lib.getExe eacnix-boot)
@@ -223,8 +258,6 @@ in
           eacnixPkgs.fedora-boot-chain
           "--dir"
           cfg.boot.directory
-          "--subpath"
-          (if cfg.mode == "specialisation" then "specialisation/eac" else "")
           "--generations"
           (toString cfg.boot.generations)
           "--timeout"
@@ -234,15 +267,7 @@ in
         ]
         ++ lib.optional config.boot.loader.efi.canTouchEfiVariables "--register"
         ++ lib.optional cfg.boot.addToBootOrder "--add-to-boot-order"
-        ++ lib.optionals (cfg.boot.hideFromSystemdBoot && config.boot.loader.systemd-boot.enable) [
-          "--hide-systemd-boot-entries"
-          "${
-            if config.boot.loader.systemd-boot.xbootldrMountPoint != null then
-              config.boot.loader.systemd-boot.xbootldrMountPoint
-            else
-              config.boot.loader.efi.efiSysMountPoint
-          }/loader/entries"
-        ]
+        ++ hideArgs
       );
       # Preconfigured with this system's ESP directory and Fedora kernel release.
       eacnix-check = pkgs.writeShellScriptBin "eacnix-check" ''
@@ -272,29 +297,66 @@ in
 
         system.build.eacnix = {
           inherit (eacnixPkgs) fedora-kernel fedora-boot-chain;
-          inherit eacnix-boot eacnix-check installCommand;
+          inherit
+            eacnix-boot
+            eacnix-check
+            installCommand
+            hideCommand
+            ;
         };
       }
       (lib.mkIf cfg.boot.install {
         # systemd-boot has installed the normal entries by now. A failure here
         # (a full ESP, usually) leaves the eac path at its previous state, so it
         # warns instead of failing the whole switch over the secondary path.
-        boot.loader.systemd-boot.extraInstallCommands = lib.mkAfter ''
-          if ! ${installCommand}; then
-            echo "warning: eacnix: the eac boot path was not updated (see above)." >&2
-          fi
-        '';
+        boot.loader.systemd-boot.extraInstallCommands = lib.mkAfter warnIfFailed;
+
+        # lanzaboote installs through boot.loader.external.installHook, which
+        # NixOS runs as system.build.installBootLoader. Wrap it: lanzaboote
+        # first (its failure fails the switch, as usual), then eacnix.
+        # Some lanzaboote services rerun its installer directly (to re-sign
+        # after preparing key enrollment, or for measured boot), outside the
+        # hook above, and recreate the eac UKIs. Hide them again afterwards.
+        # Only for services lanzaboote actually defines in this config.
+        systemd.services =
+          let
+            lzb = config.boot.lanzaboote or { };
+            rerunsInstaller =
+              lib.optional (lzb.autoEnrollKeys.enable or false) "prepare-sb-auto-enroll"
+              ++ lib.optional (lzb.measuredBoot.autoCryptenroll.enable or false) "auto-cryptenroll";
+          in
+          lib.mkIf (lanzaboote && cfg.boot.hideFromBootMenu) (
+            lib.genAttrs rerunsInstaller (_: {
+              serviceConfig.ExecStartPost = [ hideCommand ];
+            })
+          );
+
+        system.build.installBootLoader = lib.mkIf lanzaboote (
+          lib.mkOverride 90 (
+            pkgs.writeShellScript "install-lanzaboote-and-eacnix" ''
+              ${config.boot.loader.external.installHook} "$@" || exit
+              ${warnIfFailed}
+            ''
+          )
+        );
 
         assertions = [
+          {
+            assertion =
+              (config.boot.lanzaboote.autoEnrollKeys.enable or false)
+              -> config.boot.lanzaboote.autoEnrollKeys.includeMicrosoftKeys;
+            message = "eacnix: Fedora's shim is signed by Microsoft, so boot.lanzaboote.autoEnrollKeys.includeMicrosoftKeys must stay enabled.";
+          }
           {
             assertion = cfg.boot.addToBootOrder -> config.boot.loader.efi.canTouchEfiVariables;
             message = "eacnix.boot.addToBootOrder needs boot.loader.efi.canTouchEfiVariables: without it the firmware entry is never created.";
           }
         ];
 
-        warnings = lib.optional (!config.boot.loader.systemd-boot.enable) ''
+        warnings = lib.optional (!config.boot.loader.systemd-boot.enable && !lanzaboote) ''
           eacnix: the vendor boot path is only installed automatically alongside
-          systemd-boot. Run this after each switch, or set eacnix.boot.install = false:
+          systemd-boot or lanzaboote. Run this after each switch, or set
+          eacnix.boot.install = false:
             ${installCommand}
         '';
       })

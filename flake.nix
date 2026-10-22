@@ -1,10 +1,22 @@
 {
   description = "Boot NixOS on a vendor-signed kernel to meet EAC Linux v2's boot requirements";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Only for checks.lanzaboote-vm; the module detects lanzaboote by itself.
+    lanzaboote = {
+      url = "github:nix-community/lanzaboote";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.pre-commit.follows = "";
+    };
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      lanzaboote,
+    }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -30,6 +42,9 @@
         fedora-kernel-vm = pkgs.testers.runNixOSTest ./tests/fedora-kernel-vm.nix;
         secure-boot-vm = pkgs.testers.runNixOSTest ./tests/secure-boot-vm.nix;
         esp-full = pkgs.testers.runNixOSTest ./tests/esp-full.nix;
+        lanzaboote-vm = pkgs.testers.runNixOSTest (
+          import ./tests/lanzaboote-vm.nix { inherit lanzaboote; }
+        );
         # kernelPackages tools that build from `kernel.src` with `kernel.stdenv`.
         kernel-tools = pkgs.linkFarmFromDrvs "eacnix-kernel-tools" (
           with eacnixPkgs.linuxPackages-fedora;

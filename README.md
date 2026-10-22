@@ -14,7 +14,8 @@ EAC trusts. Nothing in that chain is built or signed locally.
 The first milestone is done. You can use eacnix today if your machine:
 
 - is x86_64 with UEFI, Secure Boot, and a TPM 2.0;
-- boots NixOS with **systemd-boot**;
+- boots NixOS with **systemd-boot** or **lanzaboote** (detected
+  automatically);
 - uses **no out-of-tree kernel modules** (NVIDIA's driver, ZFS, and similar
   can't be loaded on the eac path; see [Limitations](#limitations)).
 
@@ -100,9 +101,11 @@ Add the flake and enable the module:
 }
 ```
 
-Your configuration needs `boot.loader.systemd-boot.enable = true` and
-`boot.loader.efi.canTouchEfiVariables = true` (the latter lets eacnix create
-its firmware boot entry).
+Your configuration needs systemd-boot or lanzaboote, and
+`boot.loader.efi.canTouchEfiVariables = true` so eacnix can create its
+firmware boot entry. With lanzaboote, keep Microsoft's keys enrolled next to
+yours (`autoEnrollKeys.includeMicrosoftKeys`, or `sbctl enroll-keys
+--microsoft`): Fedora's shim is signed by Microsoft.
 
 After `nixos-rebuild switch`:
 
@@ -112,7 +115,10 @@ sudo eacnix-check   # on the eac path: check every requirement
 ```
 
 If you set `addToBootOrder`, you can also pick "NixOS EAC" in the firmware's
-boot menu. Either way, the eac path never becomes your default.
+boot menu. Either way, the eac path never becomes your default: eacnix only
+adds its entry behind another OS entry. On a fresh lanzaboote install, which
+boots through the firmware's fallback path, that entry appears after the
+first boot, and the next rebuild adds "NixOS EAC" behind it.
 
 ### Firmware settings
 
@@ -123,8 +129,9 @@ that undermine the requirements. `eacnix-check` warns about both of these:
   Boot as enabled but runs unsigned images anyway (on MSI boards, an "Image
   Execution Policy" of "Always Execute"). Then no `db` approval for shim
   appears in the TPM log. Set the policy for fixed disks to deny images that
-  fail verification. Your normal systemd-boot entry is unsigned, so it won't
-  boot under a strict policy; see [Your normal entry](#your-normal-entry).
+  fail verification. A plain systemd-boot entry is unsigned, so it won't boot
+  under a strict policy; lanzaboote's will. See
+  [Your normal entry](#your-normal-entry).
 - **Pre-boot DMA protection** should be enabled, if your firmware has the
   option.
 
@@ -133,23 +140,24 @@ depend on them.
 
 ## Options
 
-| Option                            | Default                  | Description                                                                                                                    |
-| --------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `eacnix.enable`                   | `false`                  | Add the eac boot path.                                                                                                         |
-| `eacnix.mode`                     | `"specialisation"`       | `"specialisation"` adds an `eac` variant of each generation. `"system"` runs Fedora's kernel on the normal system too.         |
-| `eacnix.boot.install`             | `true`                   | Install the eac boot path after systemd-boot's install.                                                                        |
-| `eacnix.boot.directory`           | `"eacnix"`               | eacnix's directory under `<ESP>/EFI`.                                                                                          |
-| `eacnix.boot.generations`         | `3`                      | eac generations kept on the ESP, for rollback.                                                                                 |
-| `eacnix.boot.timeout`             | `3`                      | grub menu timeout, in seconds.                                                                                                 |
-| `eacnix.boot.label`               | `"NixOS EAC"`            | Name of the firmware boot entry.                                                                                               |
-| `eacnix.boot.addToBootOrder`      | `false`                  | Append the entry to BootOrder so the firmware's boot menu lists it. eacnix only appends: it never reorders or removes entries. |
-| `eacnix.boot.hideFromSystemdBoot` | `true`                   | Remove the `eac` specialisation from systemd-boot's menu. Booting it from there would put systemd-boot in the measured chain.  |
-| `eacnix.kconfigServices`          | scx services, if enabled | Services that need Fedora's kernel config at `/boot/config-<release>` (libbpf).                                                |
+| Option                         | Default                  | Description                                                                                                                                                                                              |
+| ------------------------------ | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `eacnix.enable`                | `false`                  | Add the eac boot path.                                                                                                                                                                                   |
+| `eacnix.mode`                  | `"specialisation"`       | `"specialisation"` adds an `eac` variant of each generation. `"system"` runs Fedora's kernel on the normal system too.                                                                                   |
+| `eacnix.boot.install`          | `true`                   | Install the eac boot path after the bootloader's own install (systemd-boot or lanzaboote).                                                                                                               |
+| `eacnix.boot.directory`        | `"eacnix"`               | eacnix's directory under `<ESP>/EFI`.                                                                                                                                                                    |
+| `eacnix.boot.generations`      | `3`                      | eac generations kept on the ESP, for rollback.                                                                                                                                                           |
+| `eacnix.boot.timeout`          | `3`                      | grub menu timeout, in seconds.                                                                                                                                                                           |
+| `eacnix.boot.label`            | `"NixOS EAC"`            | Name of the firmware boot entry.                                                                                                                                                                         |
+| `eacnix.boot.addToBootOrder`   | `false`                  | Append the entry to BootOrder so the firmware's boot menu lists it. eacnix only appends, and only behind another OS entry: it never reorders or removes entries.                                         |
+| `eacnix.boot.hideFromBootMenu` | `true`                   | Remove the `eac` specialisation from the boot menu (the entries systemd-boot or lanzaboote write for it). Booting it from there would put the bootloader in the measured chain instead of shim and grub. |
+| `eacnix.kconfigServices`       | scx services, if enabled | Services that need Fedora's kernel config at `/boot/config-<release>` (libbpf).                                                                                                                          |
 
 ### ESP usage
 
-eacnix writes only to `<ESP>/EFI/eacnix/` (and, with `hideFromSystemdBoot`,
-removes systemd-boot's entries for the eac specialisation). Generations that share a kernel or
+eacnix writes only to `<ESP>/EFI/eacnix/` (and, with `hideFromBootMenu`,
+removes the entries systemd-boot or lanzaboote write for the eac
+specialisation). Generations that share a kernel or
 initrd share one copy, so expect about 50 MiB, and up to about 135 MiB with
 three generations that all have a different kernel. Each install checks free
 space before writing anything. If the ESP is full, nothing new is installed,
@@ -184,6 +192,11 @@ TPM event log:
   `eacnix-check` passes every check except `iommu` (QEMU has no IOMMU).
 - `fedora-kernel-vm`: NixOS on Fedora's kernel. A module with its signature
   stripped is refused under lockdown, and a sched_ext scheduler loads.
+- `lanzaboote-vm`: eacnix next to lanzaboote, with the owner's key and
+  Microsoft's in `db` and Secure Boot enforcing. lanzaboote's normal entry and
+  the eac path both boot, lanzaboote's UKI for the eac specialisation is
+  removed, and `eacnix-check` passes every check except `iommu` on the eac
+  path.
 - `esp-full`: the installer on a nearly full ESP.
 - `kernel-tools`: tools such as turbostat and cpupower build for the Fedora
   kernel.
@@ -209,7 +222,7 @@ in [docs/findings.md](docs/findings.md).
 - **The kernel follows Fedora's releases.** The pinned kernel, grub, and shim
   must be bumped together, especially when Fedora ships security fixes or
   revokes old boot components.
-- **systemd-boot only.** With another bootloader, eacnix prints the
+- **systemd-boot or lanzaboote.** With another bootloader, eacnix prints the
   `eacnix-boot install` command to run after each switch.
 - **Initrd secrets** (`boot.initrd.secrets`) aren't supported on the eac path.
 - **The measurements identify the system as NixOS.** grub measures the kernel
@@ -223,9 +236,8 @@ has to live with the same firmware settings:
 - **Microsoft keys only.** The eac entry works; an unsigned normal entry needs
   Secure Boot off. Setting `eacnix.mode = "system"` runs Fedora's kernel all
   the time, so a single compliant entry is all you need.
-- **Your own key next to Microsoft's** (for example with lanzaboote and
-  `sbctl enroll-keys --microsoft`). Both entries boot with Secure Boot
-  enforcing. Fedora's kernel uses `db` keys only to verify kexec images, which
+- **Your own key next to Microsoft's**, with lanzaboote. Both entries boot
+  with Secure Boot enforcing (`checks.lanzaboote-vm` covers this setup). Fedora's kernel uses `db` keys only to verify kexec images, which
   is disabled, so your key can't sign anything the eac path loads. Whether EAC
   accepts an extra key in `db` is a [question for Epic](#questions-for-epic).
 - **Never MOK.** Fedora's kernel trusts MOK keys for module signatures, and

@@ -26,10 +26,16 @@ for the evidence behind them.
   set.
 - **ESP ownership is explicit.** `EFI/<eacnix.boot.directory>` belongs to
   this module; lanzaboote/systemd-boot paths belong to them. Write only inside
-  paths this module owns. The one exception: `--hide-systemd-boot-entries`
-  deletes systemd-boot entries whose `init=` is an eac system, matched by
-  content (systemd-boot names entries by content hash), and never touches
-  anything else in `loader/entries`.
+  paths this module owns. The one exception is hiding the eac
+  specialisation from the boot menu: `--hide-systemd-boot-entries` deletes
+  systemd-boot entries whose `init=` is an eac system (matched by content;
+  systemd-boot names entries by content hash), and `--hide-uki-entries`
+  deletes lanzaboote's `nixos-generation-*-specialisation-<name>-*.efi` UKIs.
+  Nothing else in `loader/entries` or `EFI/Linux` is touched. lanzaboote's
+  `prepare-sb-auto-enroll` and `auto-cryptenroll` services rerun `lzbt`
+  directly, outside NixOS's install hook, and recreate those UKIs, so the
+  module adds `eacnix-boot hide` as their `ExecStartPost` (only when
+  lanzaboote defines them).
 - **No MOK, ever.** MokList is global and the vendor kernel trusts it for
   module signing, so any enrolled MOK fails EAC on every entry. Custom keys go
   only into the firmware `db`, next to Microsoft's, which stay enrolled.
@@ -42,9 +48,17 @@ for the evidence behind them.
   kernel and initrd. A failure leaves the previous entries bootable.
 - **Switch with `BootNext`.** `eac-reboot` is a one-shot switch. eacnix
   touches BootOrder only when `eacnix.boot.addToBootOrder` asks it to, and
-  then only appends its own entry if it's missing: it never reorders or
-  removes anything. Firmware may append its own entries behind it, so "last"
-  isn't an invariant; "once, and never moved" is.
+  then only appends its own entry if it's missing, and only behind another OS
+  entry (a disk or device path, not a firmware app): it never reorders or
+  removes anything, and never becomes the default boot. Firmware may append
+  its own entries behind it, so "last" isn't an invariant; "once, never
+  moved, never first" is.
+- **Bootloaders are detected, not configured.** eacnix hooks systemd-boot
+  through `extraInstallCommands`, and lanzaboote by wrapping
+  `system.build.installBootLoader` around `boot.loader.external.installHook`
+  (lanzaboote first; its failure fails the switch). lanzaboote is detected
+  with `config.boot.lanzaboote.enable or false`, so configs without the
+  lanzaboote module still evaluate.
 - **Claims match evidence.** EAC behaviour that hasn't been tested (see the
   README's questions for Epic) gets written as unknown, in docs and in option
   descriptions. The README is user- and Epic-facing: keep it neutral and
@@ -107,6 +121,14 @@ kernel event and PCR 9 is what proves the kernel was measured.
   else. It also checks that systemd-boot's menu has no eac entry, and runs
   `eacnix-check --json` on both boots. In the VM the only expected failure is
   `iommu`, because QEMU has no IOMMU here.
+- `lanzaboote-vm`: eacnix next to lanzaboote with its test keys plus
+  Microsoft's in `db`, and `autoEnrollKeys` on so `prepare-sb-auto-enroll`
+  reruns `lzbt` at first boot (the eac UKI must still end up hidden). Three
+  boots: lanzaboote without Secure Boot, lanzaboote
+  with it, then the eac path. The lanzaboote flake input exists only for this
+  test. OVMF drops `Boot####` entries that neither BootOrder nor BootNext
+  references, so the test enables `addToBootOrder`, and registers the entry
+  with a rebuild after the first boot, once the firmware has its own entry.
 - `esp-full`: `eacnix-boot` against a 24 MiB FAT image and fake generations.
   It checks that a full ESP fails before writing anything, that pruning makes
   room, and that `.tmp` leftovers get removed.

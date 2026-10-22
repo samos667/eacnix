@@ -33,13 +33,13 @@ and shim `16.1-7` from Fedora's Koji. They were inspected on 2026-10-21.
 `checks.secure-boot-vm`, run on 2026-10-21 under OVMF with a generated PK,
 Microsoft's KEK and db, and swtpm. `tpm2_eventlog` showed:
 
-| PCR | What was measured |
-|---|---|
-| 4 | Three EFI applications only: `\EFI\eacnix\shimx64.efi`, `\EFI\eacnix\grubx64.efi`, then the kernel (loaded by grub through shim). |
-| 7 | Secure Boot state, PK, KEK, db, and dbx. A `db` authority event for shim, plus shim's `SbatLevel` and its vendor certificate (`MokListRT`). |
-| 8 | Every grub command (`grub_cmd: …`), including the full `kernel_cmdline` with `init=/nix/store/…/init`. |
-| 9 | Files grub read: `grub.cfg`, the BLS entry, the kernel, and the initrd. |
-| 14 | shim's `MokList`, `MokListX`, and `MokListTrusted` (all empty). |
+| PCR | What was measured                                                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 4   | Three EFI applications only: `\EFI\eacnix\shimx64.efi`, `\EFI\eacnix\grubx64.efi`, then the kernel (loaded by grub through shim).           |
+| 7   | Secure Boot state, PK, KEK, db, and dbx. A `db` authority event for shim, plus shim's `SbatLevel` and its vendor certificate (`MokListRT`). |
+| 8   | Every grub command (`grub_cmd: …`), including the full `kernel_cmdline` with `init=/nix/store/…/init`.                                      |
+| 9   | Files grub read: `grub.cfg`, the BLS entry, the kernel, and the initrd.                                                                     |
+| 14  | shim's `MokList`, `MokListX`, and `MokListTrusted` (all empty).                                                                             |
 
 Without Secure Boot, grub loads the kernel itself instead of through shim, so
 PCR 4 has no kernel event and PCR 9 is what records the kernel.
@@ -52,6 +52,45 @@ The test needs two boots. make-disk-image boots its builder kernel through the
 same OVMF, so the image can't be built with Secure Boot on. The test boots
 once without it, enrolls the keys into the VM's variable store with
 `virt-fw-vars`, and boots again.
+
+## lanzaboote next to eacnix (VM)
+
+`checks.lanzaboote-vm`, run on 2026-10-21: OVMF with lanzaboote's test PK as
+PK and KEK, Microsoft's KEK and db, and lanzaboote's test db certificate added
+to `db`, with Secure Boot enforcing and swtpm.
+
+- lanzaboote's normal entry (its stub and UKI, signed with the owner's key)
+  boots under Secure Boot.
+- The eac path boots through Fedora's shim on the same firmware.
+  `eacnix-check` passes every check except `iommu` (QEMU has no IOMMU).
+  `measured-authority` shows the Microsoft UEFI CA approving shim, so the
+  measured chain is Microsoft-approved even with the owner's certificate in
+  `db`. The full `db`, owner's key included, is still measured into PCR 7;
+  whether EAC accepts that is unknown.
+- On real hardware (the MSI board below, 2026-10-22), the `eac` UKIs came
+  back after being hidden: lanzaboote's `prepare-sb-auto-enroll` service
+  re-signs the ESP by running `lzbt` directly at boot, bypassing NixOS's
+  install hook. eacnix now runs `eacnix-boot hide` after that service and
+  after `auto-cryptenroll`, which does the same; the VM test covers it.
+- lanzaboote builds a UKI for every specialisation
+  (`EFI/Linux/nixos-generation-<n>-specialisation-eac-<hash>.efi`); eacnix
+  deletes it after each install.
+- lanzaboote creates no `Boot####` entry; it relies on the firmware's fallback
+  path. When the test's disk image is built, BootOrder holds only OVMF's
+  internal apps (boot menu, firmware setup), so appending "NixOS EAC" would
+  have made it the default boot. eacnix appends only behind another OS entry,
+  which the firmware creates on the first boot.
+
+### OVMF and boot entries
+
+Observed in the VM tests, not on real hardware:
+
+- OVMF drops a `Boot####` entry that neither BootOrder nor BootNext
+  references. A "NixOS EAC" entry created while building the image without
+  `addToBootOrder` was gone at first boot. The MSI board below kept such an
+  entry.
+- OVMF appends its own auto-created entries (fallback device, internal apps)
+  to BootOrder at boot, after anything already there.
 
 ## Hardware: MSI MAG X870 Tomahawk WIFI
 
@@ -85,6 +124,7 @@ the TPM event log and sysfs, and with `sudo eacnix-check`.
   After changing both in the BIOS, the firmware logged
   `db → Microsoft Corporation UEFI CA 2011` for shim, and the DMA event was
   gone. Both checks pass.
+
 - **Remaining warning, IOMMU:** 37 of 38 IOMMU groups are translated, but the
   GPU's group is in `identity` (passthrough) mode despite
   `iommu.passthrough=0`. This is upstream AMD IOMMU driver behaviour, not
@@ -131,14 +171,14 @@ To reproduce the module list, parse the PE `mods` section: a
 
 From the vendored config (`pkgs/fedora/kernel-config`, 7.2.11-300.fc45):
 
-| Option | Value | Meaning for eacnix |
-|---|---|---|
-| `CONFIG_LSM` | `"lockdown,yama,integrity,selinux,bpf,landlock,ipe"` | NixOS overrides it with `lsm=` from `security.lsm`, which always includes `bpf`. Lockdown is an early LSM and stays active. |
-| `CONFIG_LOCK_DOWN_IN_EFI_SECURE_BOOT` | `y` | Lockdown turns on automatically under Secure Boot. |
-| `CONFIG_MODULE_SIG`, `CONFIG_MODULE_SIG_ALL` | `y` | Modules are signed; lockdown enforces it (`MODULE_SIG_FORCE` is unset). |
-| `CONFIG_INTEGRITY_MACHINE_KEYRING` | `y` | MOK keys are trusted for module signatures, which is why any enrolled MOK breaks the trust chain. |
-| `CONFIG_INTEGRITY_PLATFORM_KEYRING`, `CONFIG_LOAD_UEFI_KEYS` | `y` | Firmware `db` keys go to `.platform`, used only for kexec, which is disabled. |
-| `CONFIG_KEXEC`, `CONFIG_KEXEC_FILE` | `y` | kexec is built in, so the sysctl is required. |
-| `CONFIG_INTEL_IOMMU_DEFAULT_ON` | not set | eacnix passes `intel_iommu=on`. |
-| `CONFIG_IKCONFIG` | not set | No `/proc/config.gz`; see `eacnix.kconfigServices`. |
-| `CONFIG_SCHED_CLASS_EXT`, `CONFIG_DEBUG_INFO_BTF` | `y` | sched_ext schedulers work. |
+| Option                                                       | Value                                                | Meaning for eacnix                                                                                                          |
+| ------------------------------------------------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `CONFIG_LSM`                                                 | `"lockdown,yama,integrity,selinux,bpf,landlock,ipe"` | NixOS overrides it with `lsm=` from `security.lsm`, which always includes `bpf`. Lockdown is an early LSM and stays active. |
+| `CONFIG_LOCK_DOWN_IN_EFI_SECURE_BOOT`                        | `y`                                                  | Lockdown turns on automatically under Secure Boot.                                                                          |
+| `CONFIG_MODULE_SIG`, `CONFIG_MODULE_SIG_ALL`                 | `y`                                                  | Modules are signed; lockdown enforces it (`MODULE_SIG_FORCE` is unset).                                                     |
+| `CONFIG_INTEGRITY_MACHINE_KEYRING`                           | `y`                                                  | MOK keys are trusted for module signatures, which is why any enrolled MOK breaks the trust chain.                           |
+| `CONFIG_INTEGRITY_PLATFORM_KEYRING`, `CONFIG_LOAD_UEFI_KEYS` | `y`                                                  | Firmware `db` keys go to `.platform`, used only for kexec, which is disabled.                                               |
+| `CONFIG_KEXEC`, `CONFIG_KEXEC_FILE`                          | `y`                                                  | kexec is built in, so the sysctl is required.                                                                               |
+| `CONFIG_INTEL_IOMMU_DEFAULT_ON`                              | not set                                              | eacnix passes `intel_iommu=on`.                                                                                             |
+| `CONFIG_IKCONFIG`                                            | not set                                              | No `/proc/config.gz`; see `eacnix.kconfigServices`.                                                                         |
+| `CONFIG_SCHED_CLASS_EXT`, `CONFIG_DEBUG_INFO_BTF`            | `y`                                                  | sched_ext schedulers work.                                                                                                  |

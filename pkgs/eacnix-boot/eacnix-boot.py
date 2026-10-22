@@ -9,7 +9,8 @@ The layout under <esp>/EFI/<dir>/:
 Entries live outside /loader/entries so systemd-boot doesn't list them: booting
 them through systemd-boot would put an unsigned loader in the measured chain.
 For the same reason, `--hide-systemd-boot-entries` deletes the entries
-systemd-boot itself writes for the eac specialisation.
+systemd-boot itself writes for the eac specialisation, and
+`--hide-uki-entries` deletes the UKIs lanzaboote builds for it.
 """
 
 import argparse
@@ -172,13 +173,20 @@ def install(args):
         "blscfg\n",
     )
 
-    if args.hide_systemd_boot_entries:
-        hide_systemd_boot_entries(args)
+    hide(args)
     if args.register:
         register(args, efi_dir)
     if args.add_to_boot_order:
         add_to_boot_order(args.label)
     log(f"installed {len(gens)} eac generation(s) to {dest}")
+
+
+def hide(args):
+    """Remove the bootloader's own menu entries for the eac specialisation."""
+    if args.hide_systemd_boot_entries:
+        hide_systemd_boot_entries(args)
+    if args.hide_uki_entries:
+        hide_uki_entries(args)
 
 
 def hide_systemd_boot_entries(args):
@@ -240,6 +248,37 @@ def register(args, efi_dir):
     log(f"registered firmware entry {args.label!r} -> {loader}")
 
 
+def hide_uki_entries(args):
+    """Delete lanzaboote's UKIs for the eac specialisation.
+
+    lanzaboote names them nixos-generation-<n>-specialisation-<name>-<hash>.efi
+    in EFI/Linux, where systemd-boot finds them on its own. Like systemd-boot,
+    it rebuilds them on every install; this runs right after.
+    """
+    if not args.subpath:
+        return  # In "system" mode every entry is an eac system; keep them.
+    name = os.path.basename(args.subpath.rstrip("/"))
+    pattern = re.compile(rf"^nixos-generation-\d+-specialisation-{re.escape(name)}-[^/]+\.efi$")
+    uki_dir = args.hide_uki_entries
+    if not os.path.isdir(uki_dir):
+        return
+    hidden = [f for f in os.listdir(uki_dir) if pattern.match(f)]
+    for f in hidden:
+        os.remove(os.path.join(uki_dir, f))
+    if hidden:
+        log(f"hid {len(hidden)} eac UKI(s) from systemd-boot's menu")
+
+
+def boot_entries():
+    """{number: (label, device path)} for every Boot#### efibootmgr lists."""
+    entries = {}
+    for line in efibootmgr().splitlines():
+        m = re.match(r"^Boot([0-9A-Fa-f]{4})\*? (.+?)(?:\t| {2,})(.*)$", line)
+        if m:
+            entries[m.group(1).upper()] = (m.group(2).strip(), m.group(3))
+    return entries
+
+
 def add_to_boot_order(label):
     """Append the entry to BootOrder if it's missing. Never reorder or remove.
 
@@ -252,8 +291,18 @@ def add_to_boot_order(label):
         log(f"no firmware entry named {label!r}; can't add it to BootOrder")
         return
     m = re.search(r"^BootOrder: ?(\S*)", efibootmgr(), re.MULTILINE)
-    order = [n for n in (m.group(1).split(",") if m else []) if n]
-    if num.upper() in (n.upper() for n in order):
+    order = [n.upper() for n in (m.group(1).split(",") if m else []) if n]
+    if num.upper() in order:
+        return
+    # Firmware-internal apps (boot menu, setup: FvVol/FvFile paths) aren't
+    # boot targets. Without another OS entry ahead of it, the eac path would
+    # become the default boot. That happens before the firmware has created
+    # its own entry (lanzaboote boots through the fallback path); a later
+    # install adds it.
+    entries = boot_entries()
+    others = [n for n in order if n in entries and "FvFile(" not in entries[n][1] and "FvVol(" not in entries[n][1]]
+    if not others:
+        log(f"BootOrder has no other OS entry yet; not adding Boot{num} ({label}), it would become the default")
         return
     efibootmgr("--bootorder", ",".join([*order, num]))
     log(f"appended Boot{num} ({label}) to BootOrder")
@@ -271,22 +320,32 @@ def main():
     p = argparse.ArgumentParser(prog="eacnix-boot")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def hide_args(parser):
+        parser.add_argument("--profile", default="/nix/var/nix/profiles/system")
+        parser.add_argument("--subpath", default="specialisation/eac",
+                            help="eac system inside each generation ('' for the generation itself)")
+        parser.add_argument("--hide-systemd-boot-entries", metavar="DIR",
+                            help="delete systemd-boot's entries in DIR that boot an eac system")
+        parser.add_argument("--hide-uki-entries", metavar="DIR",
+                            help="delete lanzaboote's UKIs in DIR for the eac specialisation")
+
     i = sub.add_parser("install", help="sync the vendor boot path on the ESP")
     i.add_argument("--esp", required=True)
     i.add_argument("--chain", required=True, help="store path of the vendor boot chain")
     i.add_argument("--dir", default="eacnix", help="directory under <esp>/EFI")
-    i.add_argument("--profile", default="/nix/var/nix/profiles/system")
-    i.add_argument("--subpath", default="specialisation/eac",
-                   help="eac system inside each generation ('' for the generation itself)")
     i.add_argument("--generations", type=int, default=3)
     i.add_argument("--timeout", type=int, default=3)
     i.add_argument("--label", default="NixOS EAC")
     i.add_argument("--register", action="store_true", help="create the firmware entry if missing")
     i.add_argument("--add-to-boot-order", action="store_true",
                    help="append the firmware entry to BootOrder if it's missing")
-    i.add_argument("--hide-systemd-boot-entries", metavar="DIR",
-                   help="delete systemd-boot's entries in DIR that boot an eac system")
+    hide_args(i)
     i.set_defaults(func=install)
+
+    h = sub.add_parser("hide", help="only remove the bootloader's own entries for the eac specialisation "
+                                    "(for tools that rerun the bootloader install outside NixOS's hook)")
+    hide_args(h)
+    h.set_defaults(func=hide)
 
     n = sub.add_parser("next", help="boot the eac entry once, on the next boot")
     n.add_argument("--label", default="NixOS EAC")
