@@ -35,9 +35,9 @@
       ];
       # A sched_ext scheduler: its BPF program reads kernel config, which the
       # vendor's kernel only provides through eacnix.kconfigServices.
-      services.scx = {
+      services.scx-loader = {
         enable = true;
-        scheduler = "scx_lavd";
+        config.default_sched = "scx_lavd";
       };
     };
 
@@ -67,7 +67,7 @@
 
       with subtest("an scx scheduler loads its BPF program and takes over"):
           machine.wait_until_succeeds("grep -qx enabled /sys/kernel/sched_ext/state", timeout=60)
-          machine.succeed("systemctl is-active scx")
+          machine.wait_for_unit("scx_loader.service")
           machine.succeed("test -s /sys/kernel/sched_ext/root/ops")
 
       with subtest("a module with its signature stripped is refused"):
